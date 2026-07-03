@@ -339,6 +339,14 @@ function classifyError(err) {
   return "LESCO's website is currently down. Try again later or enter the amount manually.";
 }
 
+// ── Keep-alive ping (Render free tier spins down after 15 min inactivity) ────
+const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+if (RENDER_URL) {
+  setInterval(() => {
+    axios.get(`${RENDER_URL}/health`).catch(() => {});
+  }, 10 * 60 * 1000);
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Finly Proxy running on port ${PORT}`));

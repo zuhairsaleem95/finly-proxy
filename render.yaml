@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: finly-proxy
+    runtime: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: PORT
+        value: 3000
