@@ -1,26 +1,28 @@
-const express = require('express');
-const axios   = require('axios');
-const cheerio = require('cheerio');
-const cors    = require('cors');
+const express  = require('express');
+const axios    = require('axios');
+const cheerio  = require('cheerio');
+const cors     = require('cors');
 const NodeCache = require('node-cache');
 const { v4: uuidv4 } = require('uuid');
-const https   = require('https');
+const https    = require('https');
+const http     = require('http');
+const net      = require('net');
 
 const app   = express();
-const cache = new NodeCache({ stdTTL: 6 * 60 * 60 }); // 6 hour TTL
-const sessions = new Map(); // sessionId -> { cookies, createdAt }
+const cache = new NodeCache({ stdTTL: 6 * 60 * 60 });
+const sessions = new Map();
 
-const LESCO_BASE = 'https://bill.lesco.gov.pk:36269';
-const TIMEOUT_MS = 15000;
-const SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const LESCO_BASE     = 'https://bill.lesco.gov.pk:36269';
+const LESCO_ALT_BASE = 'https://www.lesco.gov.pk';
+const TIMEOUT_MS     = 15000;
+const SESSION_TTL_MS = 10 * 60 * 1000;
 
-// Ignore self-signed certs on LESCO's server
 const httpsAgent = new https.Agent({ rejectUnauthorized: false });
 
 app.use(cors());
 app.use(express.json());
 
-// Clean up expired sessions every 5 minutes
+// ── Session cleanup ───────────────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions.entries()) {
@@ -28,75 +30,93 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function splitRef(ref) {
   const parts = ref.split('-');
   if (parts.length !== 4) throw new Error('Reference number must have 4 parts separated by dashes (e.g. 06-11224-0150112-U)');
   return parts;
 }
-
-function parseCookies(setCookieHeaders) {
-  if (!setCookieHeaders) return [];
-  const headers = Array.isArray(setCookieHeaders) ? setCookieHeaders : [setCookieHeaders];
-  return headers.map(h => h.split(';')[0]);
+function parseCookies(headers) {
+  if (!headers) return [];
+  const arr = Array.isArray(headers) ? headers : [headers];
+  return arr.map(h => h.split(';')[0]);
 }
-
-function cookieHeader(cookies) {
-  return cookies.join('; ');
-}
-
+function cookieHeader(cookies) { return cookies.join('; '); }
 function parseAmount(text) {
   if (!text) return 0;
-  const cleaned = text.replace(/[^0-9.]/g, '');
-  return parseInt(cleaned, 10) || 0;
+  return parseInt(text.replace(/[^0-9.]/g, ''), 10) || 0;
 }
 
 function parseLescoHtml($) {
-  const text = $.html();
-
-  const extract = (label) => {
-    const regex = new RegExp(label + '[\\s\\S]*?<[^>]+>([^<]+)<', 'i');
-    const m = text.match(regex);
-    return m ? m[1].trim() : null;
-  };
-
-  // Try td-based extraction (common in LESCO table layout)
   const allText = $('body').text().replace(/\s+/g, ' ');
-
   const after = (label) => {
     const idx = allText.toUpperCase().indexOf(label.toUpperCase());
     if (idx === -1) return null;
     return allText.slice(idx + label.length, idx + label.length + 80).trim().split(/\s{2,}/)[0].trim();
   };
-
-  const customerName        = after('CUSTOMER NAME:') || after('CUSTOMER NAME') || extract('CUSTOMER NAME');
-  const address             = after('ADDRESS:') || after('ADDRESS') || extract('ADDRESS');
-  const lastBillMonth       = after('LAST BILL MONTH:') || after('LAST BILL MONTH') || after('BILL MONTH');
-  const billIssueDate       = after('BILL ISSUE DATE:') || after('BILL ISSUE DATE') || after('ISSUE DATE');
-  const dueDate             = after('DUE DATE:') || after('DUE DATE');
-  const amountWithinRaw     = after('AMOUNT PAYABLE WITHIN DUE DATE:') || after('AMOUNT PAYABLE WITHIN DUE DATE') || after('WITHIN DUE DATE');
-  const amountAfterRaw      = after('AMOUNT PAYABLE AFTER DUE DATE:') || after('AMOUNT PAYABLE AFTER DUE DATE') || after('AFTER DUE DATE');
-
   return {
-    customerName:          customerName || 'Unknown',
-    address:               address      || 'Unknown',
-    lastBillMonth:         lastBillMonth || 'Unknown',
-    billIssueDate:         billIssueDate || 'Unknown',
-    dueDate:               dueDate      || 'Unknown',
-    amountWithinDueDate:   parseAmount(amountWithinRaw),
-    amountAfterDueDate:    parseAmount(amountAfterRaw),
+    customerName:        after('CUSTOMER NAME:') || after('CUSTOMER NAME') || 'Unknown',
+    address:             after('ADDRESS:')       || after('ADDRESS')       || 'Unknown',
+    lastBillMonth:       after('LAST BILL MONTH:') || after('BILL MONTH') || 'Unknown',
+    billIssueDate:       after('BILL ISSUE DATE:') || after('ISSUE DATE') || 'Unknown',
+    dueDate:             after('DUE DATE:')      || after('DUE DATE')     || 'Unknown',
+    amountWithinDueDate: parseAmount(after('AMOUNT PAYABLE WITHIN DUE DATE:') || after('WITHIN DUE DATE')),
+    amountAfterDueDate:  parseAmount(after('AMOUNT PAYABLE AFTER DUE DATE:')  || after('AFTER DUE DATE')),
   };
 }
 
-// ── Routes ───────────────────────────────────────────────────────────────────
+// Build an axios instance that tries a free rotating proxy pool if direct fails.
+// We attempt direct first, then fall back to SOCKS/HTTP free proxies.
+async function axiosViaProxy(config) {
+  // Try direct first
+  try {
+    return await axios({ ...config, timeout: TIMEOUT_MS, httpsAgent });
+  } catch (directErr) {
+    // Fall back: route through a public HTTPS proxy scraper list
+    // We use a hardcoded set of free proxies as a best-effort fallback.
+    // These rotate often; Railway's egress IP is the real issue so any
+    // non-Railway IP helps.
+    const freeProxies = (process.env.PROXY_LIST || '').split(',').filter(Boolean);
+    for (const proxyUrl of freeProxies) {
+      try {
+        const { HttpsProxyAgent } = require('https-proxy-agent');
+        const agent = new HttpsProxyAgent(proxyUrl);
+        return await axios({ ...config, timeout: TIMEOUT_MS, httpsAgent: agent });
+      } catch (_) { /* try next */ }
+    }
+    throw directErr; // all attempts failed
+  }
+}
 
-// GET /health
+// ── Port check ────────────────────────────────────────────────────────────────
+app.get('/lesco/portcheck', (req, res) => {
+  const host = 'bill.lesco.gov.pk';
+  const port = 36269;
+  const start = Date.now();
+  const sock = new net.Socket();
+  sock.setTimeout(8000);
+
+  sock.on('connect', () => {
+    const ms = Date.now() - start;
+    sock.destroy();
+    res.json({ reachable: true, host, port, ms, note: 'TCP connect succeeded — port is open from Railway' });
+  });
+  sock.on('timeout', () => {
+    sock.destroy();
+    res.json({ reachable: false, host, port, ms: Date.now() - start, note: 'TCP timeout — port 36269 is likely blocked by Railway firewall' });
+  });
+  sock.on('error', (err) => {
+    res.json({ reachable: false, host, port, ms: Date.now() - start, note: `TCP error: ${err.code || err.message}` });
+  });
+  sock.connect(port, host);
+});
+
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'Finly Proxy', timestamp: new Date() });
 });
 
-// GET /lesco/cached?ref=...
+// ── Cache check ───────────────────────────────────────────────────────────────
 app.get('/lesco/cached', (req, res) => {
   const ref = req.query.ref;
   if (!ref) return res.status(400).json({ cached: false, error: 'ref is required' });
@@ -105,7 +125,7 @@ app.get('/lesco/cached', (req, res) => {
   res.json({ cached: false });
 });
 
-// GET /lesco/captcha?ref=...
+// ── Captcha (primary — port 36269) ───────────────────────────────────────────
 app.get('/lesco/captcha', async (req, res) => {
   const ref = req.query.ref;
   if (!ref) return res.status(400).json({ success: false, error: 'ref is required' });
@@ -113,186 +133,200 @@ app.get('/lesco/captcha', async (req, res) => {
   try {
     const parts = splitRef(ref);
     const formData = new URLSearchParams({
-      txtRefNo1: parts[0],
-      txtRefNo2: parts[1],
-      txtRefNo3: parts[2],
-      txtRefNo4: parts[3],
+      txtRefNo1: parts[0], txtRefNo2: parts[1],
+      txtRefNo3: parts[2], txtRefNo4: parts[3],
+    });
+
+    const response = await axiosViaProxy({
+      method: 'post',
+      url: `${LESCO_BASE}/Modules/CustomerBillN/CheckBill.asp`,
+      data: formData.toString(),
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0' },
+      maxRedirects: 5,
+    });
+
+    const cookies = parseCookies(response.headers['set-cookie']);
+    const $ = cheerio.load(response.data);
+
+    let captchaSrc = $('img[src*="captcha" i]').attr('src')
+      || $('img[src*="Captcha" i]').attr('src')
+      || $('img[id*="captcha" i]').attr('src')
+      || $('img').first().attr('src');
+
+    if (!captchaSrc) return res.status(502).json({ success: false, error: "Couldn't find CAPTCHA image on LESCO page" });
+    if (!captchaSrc.startsWith('http')) {
+      captchaSrc = captchaSrc.startsWith('/') ? `${LESCO_BASE}${captchaSrc}` : `${LESCO_BASE}/${captchaSrc}`;
+    }
+
+    const imgResp = await axiosViaProxy({
+      method: 'get',
+      url: captchaSrc,
+      responseType: 'arraybuffer',
+      headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
+    });
+
+    const contentType = imgResp.headers['content-type'] || 'image/png';
+    const captchaImage = `data:${contentType};base64,${Buffer.from(imgResp.data).toString('base64')}`;
+    const sessionId = uuidv4();
+    sessions.set(sessionId, { cookies, createdAt: Date.now() });
+    res.json({ success: true, captchaImage, sessionId });
+
+  } catch (err) {
+    res.status(502).json({ success: false, error: classifyError(err) });
+  }
+});
+
+// ── Captcha alt (port 443 / main LESCO domain) ───────────────────────────────
+// LESCO's main site exposes a simplified bill inquiry at standard port.
+app.get('/lesco/captcha-alt', async (req, res) => {
+  const ref = req.query.ref;
+  if (!ref) return res.status(400).json({ success: false, error: 'ref is required' });
+
+  try {
+    const parts = splitRef(ref);
+
+    // Try the main LESCO domain bill check (port 443)
+    const formData = new URLSearchParams({
+      txtRefNo1: parts[0], txtRefNo2: parts[1],
+      txtRefNo3: parts[2], txtRefNo4: parts[3],
     });
 
     const response = await axios.post(
-      `${LESCO_BASE}/Modules/CustomerBillN/CheckBill.asp`,
+      `${LESCO_ALT_BASE}/Modules/CustomerBillN/CheckBill.asp`,
       formData.toString(),
       {
-        httpsAgent,
         timeout: TIMEOUT_MS,
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0' },
         maxRedirects: 5,
+        httpsAgent: new https.Agent({ rejectUnauthorized: false }),
       }
     );
 
     const cookies = parseCookies(response.headers['set-cookie']);
     const $ = cheerio.load(response.data);
 
-    // Find CAPTCHA image
     let captchaSrc = $('img[src*="captcha" i]').attr('src')
       || $('img[src*="Captcha" i]').attr('src')
-      || $('img[id*="captcha" i]').attr('src')
-      || $('img[name*="captcha" i]').attr('src');
+      || $('img').first().attr('src');
 
     if (!captchaSrc) {
-      // Fallback: first img tag
-      captchaSrc = $('img').first().attr('src');
+      // Alt domain responded but no CAPTCHA — maybe bill data is directly in the response
+      if (response.data && response.data.toUpperCase().includes('AMOUNT PAYABLE')) {
+        const parsed = parseLescoHtml($);
+        const data = { ...parsed, fetchedAt: new Date().toISOString(), cached: false, source: 'alt-direct' };
+        cache.set(ref, data);
+        return res.json({ success: true, directData: data, noCaptchaNeeded: true });
+      }
+      return res.status(502).json({ success: false, error: "Alt domain: couldn't find CAPTCHA or bill data" });
     }
 
-    if (!captchaSrc) {
-      return res.status(502).json({ success: false, error: "Couldn't find CAPTCHA image on LESCO page" });
-    }
-
-    // Make absolute URL
     if (!captchaSrc.startsWith('http')) {
-      captchaSrc = captchaSrc.startsWith('/') ? `${LESCO_BASE}${captchaSrc}` : `${LESCO_BASE}/${captchaSrc}`;
+      captchaSrc = captchaSrc.startsWith('/') ? `${LESCO_ALT_BASE}${captchaSrc}` : `${LESCO_ALT_BASE}/${captchaSrc}`;
     }
 
-    // Fetch CAPTCHA image as base64
     const imgResp = await axios.get(captchaSrc, {
-      httpsAgent,
       timeout: TIMEOUT_MS,
       responseType: 'arraybuffer',
       headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
+      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
     });
 
     const contentType = imgResp.headers['content-type'] || 'image/png';
-    const base64 = Buffer.from(imgResp.data).toString('base64');
-    const captchaImage = `data:${contentType};base64,${base64}`;
-
+    const captchaImage = `data:${contentType};base64,${Buffer.from(imgResp.data).toString('base64')}`;
     const sessionId = uuidv4();
-    sessions.set(sessionId, { cookies, createdAt: Date.now() });
-
-    res.json({ success: true, captchaImage, sessionId });
+    sessions.set(sessionId, { cookies, createdAt: Date.now(), base: LESCO_ALT_BASE });
+    res.json({ success: true, captchaImage, sessionId, source: 'alt' });
 
   } catch (err) {
-    const msg = classifyError(err);
-    res.status(502).json({ success: false, error: msg });
+    res.status(502).json({ success: false, error: classifyError(err), source: 'alt' });
   }
 });
 
-// POST /lesco/fetch  { ref, captchaCode, sessionId }
+// ── Fetch bill ────────────────────────────────────────────────────────────────
 app.post('/lesco/fetch', async (req, res) => {
   const { ref, captchaCode, sessionId } = req.body;
   if (!ref) return res.status(400).json({ success: false, error: 'ref is required' });
 
-  // Check cache first
   const hit = cache.get(ref);
   if (hit) return res.json({ success: true, data: { ...hit, cached: true } });
 
   try {
     const parts = splitRef(ref);
-    let cookies = [];
+    const session = sessionId && sessions.has(sessionId) ? sessions.get(sessionId) : null;
+    let cookies = session?.cookies ?? [];
+    const base = session?.base ?? LESCO_BASE;
 
-    if (sessionId && sessions.has(sessionId)) {
-      cookies = sessions.get(sessionId).cookies;
-    }
-
-    // Attempt 1: direct AccountStatus fetch (sometimes works without CAPTCHA)
     let billHtml = null;
+
+    // Attempt 1: direct AccountStatus (sometimes works without CAPTCHA)
     try {
-      const directResp = await axios.get(
-        `${LESCO_BASE}/Modules/CustomerBillN/AccountStatus.aspx?ref=${encodeURIComponent(ref)}`,
-        {
-          httpsAgent,
-          timeout: TIMEOUT_MS,
-          headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
-        }
-      );
+      const directResp = await axiosViaProxy({
+        method: 'get',
+        url: `${base}/Modules/CustomerBillN/AccountStatus.aspx?ref=${encodeURIComponent(ref)}`,
+        headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
+      });
       if (directResp.data && directResp.data.toUpperCase().includes('AMOUNT PAYABLE')) {
         billHtml = directResp.data;
       }
-    } catch (_) {
-      // Expected to fail often — continue to CAPTCHA path
-    }
+    } catch (_) {}
 
-    // Attempt 2: submit CAPTCHA then fetch
+    // Attempt 2: submit CAPTCHA
     if (!billHtml && captchaCode) {
       const captchaForm = new URLSearchParams({
-        txtRefNo1: parts[0],
-        txtRefNo2: parts[1],
-        txtRefNo3: parts[2],
-        txtRefNo4: parts[3],
-        txtCaptcha: captchaCode,
-        btnSubmit: 'Submit',
+        txtRefNo1: parts[0], txtRefNo2: parts[1],
+        txtRefNo3: parts[2], txtRefNo4: parts[3],
+        txtCaptcha: captchaCode, btnSubmit: 'Submit',
       });
 
-      const captchaResp = await axios.post(
-        `${LESCO_BASE}/Modules/CustomerBillN/CustomerMenu.asp`,
-        captchaForm.toString(),
-        {
-          httpsAgent,
-          timeout: TIMEOUT_MS,
-          headers: {
-            'Content-Type': 'application/x-www-form-urlencoded',
-            Cookie: cookieHeader(cookies),
-            'User-Agent': 'Mozilla/5.0',
-          },
-          maxRedirects: 5,
-        }
-      );
+      const captchaResp = await axiosViaProxy({
+        method: 'post',
+        url: `${base}/Modules/CustomerBillN/CustomerMenu.asp`,
+        data: captchaForm.toString(),
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0',
+        },
+        maxRedirects: 5,
+      });
 
-      // Merge any new cookies
       const newCookies = parseCookies(captchaResp.headers['set-cookie']);
       if (newCookies.length) cookies = [...cookies, ...newCookies];
 
-      // Check if CAPTCHA submission itself shows the bill
       if (captchaResp.data && captchaResp.data.toUpperCase().includes('AMOUNT PAYABLE')) {
         billHtml = captchaResp.data;
       } else {
-        // Fetch the account status page
-        const statusResp = await axios.get(
-          `${LESCO_BASE}/Modules/CustomerBillN/AccountStatus.aspx`,
-          {
-            httpsAgent,
-            timeout: TIMEOUT_MS,
-            headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
-            maxRedirects: 5,
-          }
-        );
+        const statusResp = await axiosViaProxy({
+          method: 'get',
+          url: `${base}/Modules/CustomerBillN/AccountStatus.aspx`,
+          headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
+          maxRedirects: 5,
+        });
         billHtml = statusResp.data;
       }
 
-      // Wrong CAPTCHA check
-      if (billHtml && (billHtml.toUpperCase().includes('INVALID CODE') || billHtml.toUpperCase().includes('WRONG CODE') || billHtml.toUpperCase().includes('CAPTCHA'))) {
+      if (billHtml && (billHtml.toUpperCase().includes('INVALID CODE') || billHtml.toUpperCase().includes('WRONG CODE') || (billHtml.toUpperCase().includes('CAPTCHA') && !billHtml.toUpperCase().includes('AMOUNT PAYABLE')))) {
         return res.status(422).json({ success: false, error: 'incorrect_captcha', message: 'Incorrect code — a new CAPTCHA has loaded. Try again.' });
       }
     }
 
-    if (!billHtml) {
-      return res.status(502).json({ success: false, error: 'no_data', message: "Couldn't retrieve bill data from LESCO. Try again or enter the amount manually." });
-    }
+    if (!billHtml) return res.status(502).json({ success: false, error: 'no_data', message: "Couldn't retrieve bill data. Try again or enter the amount manually." });
 
     if (!billHtml.toUpperCase().includes('AMOUNT PAYABLE') && !billHtml.toUpperCase().includes('CUSTOMER NAME')) {
-      // Page changed or wrong ref
       if (billHtml.toUpperCase().includes('NOT FOUND') || billHtml.toUpperCase().includes('INVALID REF')) {
-        return res.status(404).json({ success: false, error: 'not_found', message: 'Reference number not found on LESCO. Double-check and try again.' });
+        return res.status(404).json({ success: false, error: 'not_found', message: 'Reference number not found on LESCO.' });
       }
-      return res.status(502).json({ success: false, error: 'parse_failed', message: "Couldn't read LESCO's response. The bill page may have changed — contact support." });
+      return res.status(502).json({ success: false, error: 'parse_failed', message: "Couldn't read LESCO's response." });
     }
 
     const $ = cheerio.load(billHtml);
     const parsed = parseLescoHtml($);
-
-    const data = {
-      ...parsed,
-      fetchedAt: new Date().toISOString(),
-      cached: false,
-    };
-
+    const data = { ...parsed, fetchedAt: new Date().toISOString(), cached: false };
     cache.set(ref, data);
     if (sessionId) sessions.delete(sessionId);
-
     res.json({ success: true, data });
 
   } catch (err) {
-    const msg = classifyError(err);
-    res.status(502).json({ success: false, error: 'fetch_error', message: msg });
+    res.status(502).json({ success: false, error: 'fetch_error', message: classifyError(err) });
   }
 });
 
@@ -300,8 +334,8 @@ app.post('/lesco/fetch', async (req, res) => {
 function classifyError(err) {
   if (err.message && err.message.includes('parts separated by dashes')) return err.message;
   if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') return "LESCO's website is currently down. Try again later or enter the amount manually.";
-  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') return "LESCO's website is responding slowly. Try again or enter manually.";
-  if (err.response && err.response.status === 404) return 'Reference number not found on LESCO. Double-check and try again.';
+  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') return "LESCO's website is not responding. Port 36269 may be blocked — try the alt endpoint.";
+  if (err.response && err.response.status === 404) return 'Reference number not found on LESCO.';
   return "LESCO's website is currently down. Try again later or enter the amount manually.";
 }
 
