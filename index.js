@@ -1,119 +1,181 @@
-const express  = require('express');
-const axios    = require('axios');
-const cheerio  = require('cheerio');
-const cors     = require('cors');
+const express   = require('express');
+const axios     = require('axios');
+const cheerio   = require('cheerio');
+const cors      = require('cors');
 const NodeCache = require('node-cache');
-const { v4: uuidv4 } = require('uuid');
-const https    = require('https');
-const http     = require('http');
-const net      = require('net');
+const net       = require('net');
 
 const app   = express();
 const cache = new NodeCache({ stdTTL: 6 * 60 * 60 });
-const sessions = new Map();
 
-const LESCO_BASE     = 'https://bill.lesco.gov.pk:36269';
-const LESCO_ALT_BASE = 'https://www.lesco.gov.pk';
-const TIMEOUT_MS     = 15000;
-const SESSION_TTL_MS = 10 * 60 * 1000;
-
-const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+// ── PITC endpoints (port 443, no CAPTCHA, reachable from any cloud provider) ──
+const PITC_LESCO = 'https://bill.pitc.com.pk/lescobill/general';
+const TIMEOUT_MS = 15000;
 
 app.use(cors());
 app.use(express.json());
 
-// ── Session cleanup ───────────────────────────────────────────────────────────
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of sessions.entries()) {
-    if (now - session.createdAt > SESSION_TTL_MS) sessions.delete(id);
-  }
-}, 5 * 60 * 1000);
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
-function splitRef(ref) {
+
+// Convert "06-11224-0150112-U" → "0611224015012" (14-digit numeric refno for PITC)
+// PITC drops the trailing letter — only the numeric parts joined.
+function toRefno(ref) {
   const parts = ref.split('-');
-  if (parts.length !== 4) throw new Error('Reference number must have 4 parts separated by dashes (e.g. 06-11224-0150112-U)');
-  return parts;
+  if (parts.length < 3) throw new Error('Reference number must be in XX-XXXXX-XXXXXXX-X format');
+  return parts.slice(0, 3).join('');
 }
-function parseCookies(headers) {
-  if (!headers) return [];
-  const arr = Array.isArray(headers) ? headers : [headers];
-  return arr.map(h => h.split(';')[0]);
-}
-function cookieHeader(cookies) { return cookies.join('; '); }
+
 function parseAmount(text) {
   if (!text) return 0;
-  return parseInt(text.replace(/[^0-9.]/g, ''), 10) || 0;
+  return parseInt(text.replace(/[^0-9]/g, ''), 10) || 0;
 }
 
-function parseLescoHtml($) {
-  const allText = $('body').text().replace(/\s+/g, ' ');
+// Parse PITC HTML — tries selector-based first, falls back to text scan.
+function parsePitcHtml($, rawHtml) {
+  // Strategy 1: scan structured rows
+  // PITC renders rows like: <div class="row"> <div>Label</div><div>Value</div> </div>
+  const fields = {};
+  $('tr, .row, .row-shaded').each((_, el) => {
+    const cells = $(el).find('td, th, div, strong, span');
+    if (cells.length >= 2) {
+      const label = $(cells[0]).text().trim().toUpperCase().replace(/\s+/g, ' ');
+      const value = $(cells[1]).text().trim();
+      if (label && value) fields[label] = value;
+    }
+  });
+
+  // Strategy 2: plain text scan (most reliable across layout changes)
+  const allText = (rawHtml || $('body').text()).replace(/\s+/g, ' ');
   const after = (label) => {
     const idx = allText.toUpperCase().indexOf(label.toUpperCase());
     if (idx === -1) return null;
-    return allText.slice(idx + label.length, idx + label.length + 80).trim().split(/\s{2,}/)[0].trim();
+    return allText.slice(idx + label.length, idx + label.length + 100).trim().split(/\s{2,}/)[0].trim();
   };
-  return {
-    customerName:        after('CUSTOMER NAME:') || after('CUSTOMER NAME') || 'Unknown',
-    address:             after('ADDRESS:')       || after('ADDRESS')       || 'Unknown',
-    lastBillMonth:       after('LAST BILL MONTH:') || after('BILL MONTH') || 'Unknown',
-    billIssueDate:       after('BILL ISSUE DATE:') || after('ISSUE DATE') || 'Unknown',
-    dueDate:             after('DUE DATE:')      || after('DUE DATE')     || 'Unknown',
-    amountWithinDueDate: parseAmount(after('AMOUNT PAYABLE WITHIN DUE DATE:') || after('WITHIN DUE DATE')),
-    amountAfterDueDate:  parseAmount(after('AMOUNT PAYABLE AFTER DUE DATE:')  || after('AFTER DUE DATE')),
-  };
-}
 
-// Build an axios instance that tries a free rotating proxy pool if direct fails.
-// We attempt direct first, then fall back to SOCKS/HTTP free proxies.
-async function axiosViaProxy(config) {
-  // Try direct first
-  try {
-    return await axios({ ...config, timeout: TIMEOUT_MS, httpsAgent });
-  } catch (directErr) {
-    // Fall back: route through a public HTTPS proxy scraper list
-    // We use a hardcoded set of free proxies as a best-effort fallback.
-    // These rotate often; Railway's egress IP is the real issue so any
-    // non-Railway IP helps.
-    const freeProxies = (process.env.PROXY_LIST || '').split(',').filter(Boolean);
-    for (const proxyUrl of freeProxies) {
-      try {
-        const { HttpsProxyAgent } = require('https-proxy-agent');
-        const agent = new HttpsProxyAgent(proxyUrl);
-        return await axios({ ...config, timeout: TIMEOUT_MS, httpsAgent: agent });
-      } catch (_) { /* try next */ }
+  const get = (...labels) => {
+    for (const l of labels) {
+      const v = fields[l.toUpperCase()] || after(l);
+      if (v && v.length < 80) return v;
     }
-    throw directErr; // all attempts failed
-  }
+    return null;
+  };
+
+  const customerName        = get('CUSTOMER NAME:', 'NAME:', 'CONSUMER NAME:') || 'Unknown';
+  const address             = get('ADDRESS:', 'INSTALLATION ADDRESS:') || 'Unknown';
+  const lastBillMonth       = get('BILL MONTH:', 'LAST BILL MONTH:', 'MONTH:') || 'Unknown';
+  const billIssueDate       = get('BILL ISSUE DATE:', 'ISSUE DATE:', 'BILL DATE:') || 'Unknown';
+  const dueDate             = get('DUE DATE:', 'PAYABLE DATE:', 'LAST DATE:') || 'Unknown';
+  const amountWithinDueDate = parseAmount(get('AMOUNT PAYABLE WITHIN DUE DATE:', 'AMOUNT WITHIN DUE DATE:', 'PAYABLE WITHIN DUE DATE:', 'WITHIN DUE DATE:'));
+  const amountAfterDueDate  = parseAmount(get('AMOUNT PAYABLE AFTER DUE DATE:', 'AMOUNT AFTER DUE DATE:', 'AFTER DUE DATE:'));
+  const unitsConsumed       = get('UNITS CONSUMED:', 'UNITS:') || null;
+
+  return { customerName, address, lastBillMonth, billIssueDate, dueDate, amountWithinDueDate, amountAfterDueDate, unitsConsumed };
 }
 
-// ── Port check ────────────────────────────────────────────────────────────────
-app.get('/lesco/portcheck', (req, res) => {
-  const host = 'bill.lesco.gov.pk';
-  const port = 36269;
-  const start = Date.now();
-  const sock = new net.Socket();
-  sock.setTimeout(8000);
+// Core PITC fetch — called by multiple routes
+async function fetchPitcBill(ref) {
+  const refno = toRefno(ref);
+  console.log(`[PITC] Fetching ref=${ref} refno=${refno}`);
 
-  sock.on('connect', () => {
-    const ms = Date.now() - start;
-    sock.destroy();
-    res.json({ reachable: true, host, port, ms, note: 'TCP connect succeeded — port is open from Railway' });
+  const response = await axios.get(PITC_LESCO, {
+    params: { refno },
+    timeout: TIMEOUT_MS,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+    },
   });
-  sock.on('timeout', () => {
-    sock.destroy();
-    res.json({ reachable: false, host, port, ms: Date.now() - start, note: 'TCP timeout — port 36269 is likely blocked by Railway firewall' });
-  });
-  sock.on('error', (err) => {
-    res.json({ reachable: false, host, port, ms: Date.now() - start, note: `TCP error: ${err.code || err.message}` });
-  });
-  sock.connect(port, host);
-});
+
+  console.log(`[PITC] HTTP ${response.status} — body length: ${response.data?.length ?? 0}`);
+
+  const html  = response.data || '';
+  const upper = html.toUpperCase();
+
+  // Detect "not found" before parsing
+  if (
+    upper.includes('NO RECORD FOUND') ||
+    upper.includes('NOT FOUND') ||
+    upper.includes('INVALID REF') ||
+    upper.includes('RECORD NOT FOUND') ||
+    (html.length < 300 && !upper.includes('AMOUNT'))
+  ) {
+    console.log('[PITC] Not found / invalid ref');
+    return { notFound: true };
+  }
+
+  if (!upper.includes('AMOUNT') && !upper.includes('CUSTOMER') && !upper.includes('CONSUMER')) {
+    console.log('[PITC] Response does not look like bill data');
+    console.log('[PITC] First 500 chars:', html.slice(0, 500));
+    return { unparseable: true, snippet: html.slice(0, 500) };
+  }
+
+  const $ = cheerio.load(html);
+  const parsed = parsePitcHtml($, html);
+  console.log('[PITC] Parsed:', JSON.stringify(parsed));
+  return { ok: true, parsed };
+}
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'Finly Proxy', timestamp: new Date() });
+  res.json({ status: 'ok', service: 'Finly Proxy (PITC)', timestamp: new Date() });
+});
+
+// ── PITC port check (443 — should always be reachable) ───────────────────────
+app.get('/pitc/portcheck', (req, res) => {
+  const host = 'bill.pitc.com.pk';
+  const port = 443;
+  const start = Date.now();
+  const sock  = new net.Socket();
+  sock.setTimeout(6000);
+  sock.on('connect', () => { const ms = Date.now() - start; sock.destroy(); res.json({ reachable: true, host, port, ms, note: 'TCP connect OK — PITC is reachable on port 443' }); });
+  sock.on('timeout', () => { sock.destroy(); res.json({ reachable: false, host, port, ms: Date.now() - start, note: 'TCP timeout on port 443 — unexpected' }); });
+  sock.on('error',   (e) => { res.json({ reachable: false, host, port, ms: Date.now() - start, note: `TCP error: ${e.code || e.message}` }); });
+  sock.connect(port, host);
+});
+
+// ── PITC raw test — inspect exactly what we get ──────────────────────────────
+app.get('/lesco/pitc-test', async (req, res) => {
+  const ref = req.query.ref;
+  if (!ref) return res.status(400).json({ error: 'ref is required — e.g. ?ref=06-11224-0150112-U' });
+
+  let refno;
+  try { refno = toRefno(ref); } catch (e) { return res.status(400).json({ error: e.message }); }
+
+  const result = { ref, refno, url: `${PITC_LESCO}?refno=${refno}`, attempts: [] };
+
+  // Attempt 1: numeric refno (parts 0-2 joined)
+  for (const params of [{ refno }, { appno: refno }, { refno: ref.split('-').slice(0,3).join('') }]) {
+    try {
+      const r = await axios.get(PITC_LESCO, {
+        params,
+        timeout: TIMEOUT_MS,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36', Accept: 'text/html,*/*' },
+      });
+      const html = r.data || '';
+      const upper = html.toUpperCase();
+      const hasAmount   = upper.includes('AMOUNT');
+      const hasCustomer = upper.includes('CUSTOMER') || upper.includes('CONSUMER');
+      result.attempts.push({
+        params,
+        status: r.status,
+        bodyLength: html.length,
+        hasAmount,
+        hasCustomer,
+        snippet: html.slice(0, 800),
+      });
+      if (hasAmount || hasCustomer) {
+        const $ = cheerio.load(html);
+        result.parsed = parsePitcHtml($, html);
+        result.success = true;
+        break;
+      }
+    } catch (e) {
+      result.attempts.push({ params, error: e.message, code: e.code, status: e.response?.status, snippet: e.response?.data?.slice?.(0, 400) });
+    }
+  }
+
+  res.json(result);
 });
 
 // ── Cache check ───────────────────────────────────────────────────────────────
@@ -125,218 +187,73 @@ app.get('/lesco/cached', (req, res) => {
   res.json({ cached: false });
 });
 
-// ── Captcha (primary — port 36269) ───────────────────────────────────────────
+// ── /lesco/captcha — now PITC-backed, no CAPTCHA needed ──────────────────────
+// Returns { success, noCaptchaNeeded: true, data } when PITC works.
+// App checks noCaptchaNeeded and skips the CAPTCHA UI entirely.
 app.get('/lesco/captcha', async (req, res) => {
   const ref = req.query.ref;
   if (!ref) return res.status(400).json({ success: false, error: 'ref is required' });
 
+  // Cache hit — return immediately
+  const hit = cache.get(ref);
+  if (hit) return res.json({ success: true, noCaptchaNeeded: true, data: { ...hit, cached: true } });
+
   try {
-    const parts = splitRef(ref);
-    const formData = new URLSearchParams({
-      txtRefNo1: parts[0], txtRefNo2: parts[1],
-      txtRefNo3: parts[2], txtRefNo4: parts[3],
-    });
+    const result = await fetchPitcBill(ref);
 
-    const response = await axiosViaProxy({
-      method: 'post',
-      url: `${LESCO_BASE}/Modules/CustomerBillN/CheckBill.asp`,
-      data: formData.toString(),
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0' },
-      maxRedirects: 5,
-    });
-
-    const cookies = parseCookies(response.headers['set-cookie']);
-    const $ = cheerio.load(response.data);
-
-    let captchaSrc = $('img[src*="captcha" i]').attr('src')
-      || $('img[src*="Captcha" i]').attr('src')
-      || $('img[id*="captcha" i]').attr('src')
-      || $('img').first().attr('src');
-
-    if (!captchaSrc) return res.status(502).json({ success: false, error: "Couldn't find CAPTCHA image on LESCO page" });
-    if (!captchaSrc.startsWith('http')) {
-      captchaSrc = captchaSrc.startsWith('/') ? `${LESCO_BASE}${captchaSrc}` : `${LESCO_BASE}/${captchaSrc}`;
+    if (result.notFound) {
+      return res.status(404).json({ success: false, error: 'not_found', message: 'Reference number not found on PITC/LESCO.' });
+    }
+    if (result.unparseable) {
+      return res.status(502).json({ success: false, error: 'parse_failed', message: "Couldn't read bill data from PITC. Try again.", debug: result.snippet });
     }
 
-    const imgResp = await axiosViaProxy({
-      method: 'get',
-      url: captchaSrc,
-      responseType: 'arraybuffer',
-      headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
-    });
-
-    const contentType = imgResp.headers['content-type'] || 'image/png';
-    const captchaImage = `data:${contentType};base64,${Buffer.from(imgResp.data).toString('base64')}`;
-    const sessionId = uuidv4();
-    sessions.set(sessionId, { cookies, createdAt: Date.now() });
-    res.json({ success: true, captchaImage, sessionId });
+    const data = { ...result.parsed, fetchedAt: new Date().toISOString(), cached: false, source: 'pitc' };
+    cache.set(ref, data);
+    return res.json({ success: true, noCaptchaNeeded: true, data });
 
   } catch (err) {
-    res.status(502).json({ success: false, error: classifyError(err) });
+    console.error('[PITC] /lesco/captcha error:', err.message);
+    return res.status(502).json({ success: false, error: classifyError(err) });
   }
 });
 
-// ── Captcha alt (port 443 / main LESCO domain) ───────────────────────────────
-// LESCO's main site exposes a simplified bill inquiry at standard port.
-app.get('/lesco/captcha-alt', async (req, res) => {
-  const ref = req.query.ref;
-  if (!ref) return res.status(400).json({ success: false, error: 'ref is required' });
-
-  try {
-    const parts = splitRef(ref);
-
-    // Try the main LESCO domain bill check (port 443)
-    const formData = new URLSearchParams({
-      txtRefNo1: parts[0], txtRefNo2: parts[1],
-      txtRefNo3: parts[2], txtRefNo4: parts[3],
-    });
-
-    const response = await axios.post(
-      `${LESCO_ALT_BASE}/Modules/CustomerBillN/CheckBill.asp`,
-      formData.toString(),
-      {
-        timeout: TIMEOUT_MS,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0' },
-        maxRedirects: 5,
-        httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-      }
-    );
-
-    const cookies = parseCookies(response.headers['set-cookie']);
-    const $ = cheerio.load(response.data);
-
-    let captchaSrc = $('img[src*="captcha" i]').attr('src')
-      || $('img[src*="Captcha" i]').attr('src')
-      || $('img').first().attr('src');
-
-    if (!captchaSrc) {
-      // Alt domain responded but no CAPTCHA — maybe bill data is directly in the response
-      if (response.data && response.data.toUpperCase().includes('AMOUNT PAYABLE')) {
-        const parsed = parseLescoHtml($);
-        const data = { ...parsed, fetchedAt: new Date().toISOString(), cached: false, source: 'alt-direct' };
-        cache.set(ref, data);
-        return res.json({ success: true, directData: data, noCaptchaNeeded: true });
-      }
-      return res.status(502).json({ success: false, error: "Alt domain: couldn't find CAPTCHA or bill data" });
-    }
-
-    if (!captchaSrc.startsWith('http')) {
-      captchaSrc = captchaSrc.startsWith('/') ? `${LESCO_ALT_BASE}${captchaSrc}` : `${LESCO_ALT_BASE}/${captchaSrc}`;
-    }
-
-    const imgResp = await axios.get(captchaSrc, {
-      timeout: TIMEOUT_MS,
-      responseType: 'arraybuffer',
-      headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
-    });
-
-    const contentType = imgResp.headers['content-type'] || 'image/png';
-    const captchaImage = `data:${contentType};base64,${Buffer.from(imgResp.data).toString('base64')}`;
-    const sessionId = uuidv4();
-    sessions.set(sessionId, { cookies, createdAt: Date.now(), base: LESCO_ALT_BASE });
-    res.json({ success: true, captchaImage, sessionId, source: 'alt' });
-
-  } catch (err) {
-    res.status(502).json({ success: false, error: classifyError(err), source: 'alt' });
-  }
-});
-
-// ── Fetch bill ────────────────────────────────────────────────────────────────
+// ── /lesco/fetch — PITC-backed, captchaCode ignored ──────────────────────────
 app.post('/lesco/fetch', async (req, res) => {
-  const { ref, captchaCode, sessionId } = req.body;
+  const { ref } = req.body;
   if (!ref) return res.status(400).json({ success: false, error: 'ref is required' });
 
   const hit = cache.get(ref);
   if (hit) return res.json({ success: true, data: { ...hit, cached: true } });
 
   try {
-    const parts = splitRef(ref);
-    const session = sessionId && sessions.has(sessionId) ? sessions.get(sessionId) : null;
-    let cookies = session?.cookies ?? [];
-    const base = session?.base ?? LESCO_BASE;
+    const result = await fetchPitcBill(ref);
 
-    let billHtml = null;
-
-    // Attempt 1: direct AccountStatus (sometimes works without CAPTCHA)
-    try {
-      const directResp = await axiosViaProxy({
-        method: 'get',
-        url: `${base}/Modules/CustomerBillN/AccountStatus.aspx?ref=${encodeURIComponent(ref)}`,
-        headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
-      });
-      if (directResp.data && directResp.data.toUpperCase().includes('AMOUNT PAYABLE')) {
-        billHtml = directResp.data;
-      }
-    } catch (_) {}
-
-    // Attempt 2: submit CAPTCHA
-    if (!billHtml && captchaCode) {
-      const captchaForm = new URLSearchParams({
-        txtRefNo1: parts[0], txtRefNo2: parts[1],
-        txtRefNo3: parts[2], txtRefNo4: parts[3],
-        txtCaptcha: captchaCode, btnSubmit: 'Submit',
-      });
-
-      const captchaResp = await axiosViaProxy({
-        method: 'post',
-        url: `${base}/Modules/CustomerBillN/CustomerMenu.asp`,
-        data: captchaForm.toString(),
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0',
-        },
-        maxRedirects: 5,
-      });
-
-      const newCookies = parseCookies(captchaResp.headers['set-cookie']);
-      if (newCookies.length) cookies = [...cookies, ...newCookies];
-
-      if (captchaResp.data && captchaResp.data.toUpperCase().includes('AMOUNT PAYABLE')) {
-        billHtml = captchaResp.data;
-      } else {
-        const statusResp = await axiosViaProxy({
-          method: 'get',
-          url: `${base}/Modules/CustomerBillN/AccountStatus.aspx`,
-          headers: { Cookie: cookieHeader(cookies), 'User-Agent': 'Mozilla/5.0' },
-          maxRedirects: 5,
-        });
-        billHtml = statusResp.data;
-      }
-
-      if (billHtml && (billHtml.toUpperCase().includes('INVALID CODE') || billHtml.toUpperCase().includes('WRONG CODE') || (billHtml.toUpperCase().includes('CAPTCHA') && !billHtml.toUpperCase().includes('AMOUNT PAYABLE')))) {
-        return res.status(422).json({ success: false, error: 'incorrect_captcha', message: 'Incorrect code — a new CAPTCHA has loaded. Try again.' });
-      }
+    if (result.notFound) {
+      return res.status(404).json({ success: false, error: 'not_found', message: 'Reference number not found on PITC/LESCO.' });
+    }
+    if (result.unparseable) {
+      return res.status(502).json({ success: false, error: 'parse_failed', message: "Couldn't read bill data from PITC. Try again or enter the amount manually." });
     }
 
-    if (!billHtml) return res.status(502).json({ success: false, error: 'no_data', message: "Couldn't retrieve bill data. Try again or enter the amount manually." });
-
-    if (!billHtml.toUpperCase().includes('AMOUNT PAYABLE') && !billHtml.toUpperCase().includes('CUSTOMER NAME')) {
-      if (billHtml.toUpperCase().includes('NOT FOUND') || billHtml.toUpperCase().includes('INVALID REF')) {
-        return res.status(404).json({ success: false, error: 'not_found', message: 'Reference number not found on LESCO.' });
-      }
-      return res.status(502).json({ success: false, error: 'parse_failed', message: "Couldn't read LESCO's response." });
-    }
-
-    const $ = cheerio.load(billHtml);
-    const parsed = parseLescoHtml($);
-    const data = { ...parsed, fetchedAt: new Date().toISOString(), cached: false };
+    const data = { ...result.parsed, fetchedAt: new Date().toISOString(), cached: false, source: 'pitc' };
     cache.set(ref, data);
-    if (sessionId) sessions.delete(sessionId);
     res.json({ success: true, data });
 
   } catch (err) {
+    console.error('[PITC] /lesco/fetch error:', err.message);
     res.status(502).json({ success: false, error: 'fetch_error', message: classifyError(err) });
   }
 });
 
 // ── Error classifier ──────────────────────────────────────────────────────────
 function classifyError(err) {
-  if (err.message && err.message.includes('parts separated by dashes')) return err.message;
-  if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') return "LESCO's website is currently down. Try again later or enter the amount manually.";
-  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') return "LESCO's website is not responding. Port 36269 may be blocked — try the alt endpoint.";
-  if (err.response && err.response.status === 404) return 'Reference number not found on LESCO.';
-  return "LESCO's website is currently down. Try again later or enter the amount manually.";
+  if (err.message?.includes('format')) return err.message;
+  if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') return "PITC bill portal is currently unreachable. Try again later or enter the amount manually.";
+  if (err.code === 'ETIMEDOUT' || err.code === 'ECONNABORTED') return "PITC bill portal timed out. Try again or enter the amount manually.";
+  if (err.response?.status === 404) return 'Reference number not found.';
+  if (err.response?.status === 503) return 'PITC portal is temporarily unavailable. Try again later.';
+  return "Couldn't retrieve bill data. Try again or enter the amount manually.";
 }
 
 // ── Keep-alive ping (Render free tier spins down after 15 min inactivity) ────
@@ -349,4 +266,4 @@ if (RENDER_URL) {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Finly Proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Finly Proxy (PITC) running on port ${PORT}`));
